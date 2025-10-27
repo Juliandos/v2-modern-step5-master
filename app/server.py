@@ -1,5 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -80,19 +80,68 @@ async def stream_query(request: QueryRequest):
     """
     async def generate_response():
         try:
+            collected_answer = ""
+            collected_docs = []
+            
             async for chunk in get_chain_stream(
                 question=request.question,
                 config=request.config if hasattr(request, 'config') and request.config else None
             ):
-                yield f"data: {json.dumps({'chunk': str(chunk)})}\n\n"
+                # Procesar cada chunk según su tipo
+                if isinstance(chunk, dict):
+                    # Si el chunk tiene 'answer', es contenido de texto
+                    if 'answer' in chunk:
+                        answer_content = chunk['answer']
+                        # Extraer el contenido del mensaje si es un objeto
+                        if hasattr(answer_content, 'content'):
+                            text_chunk = answer_content.content
+                        elif isinstance(answer_content, str):
+                            text_chunk = answer_content
+                        else:
+                            text_chunk = str(answer_content)
+                        
+                        collected_answer += text_chunk
+                        
+                        # Enviar el chunk de texto al frontend
+                        yield f"data: {json.dumps({'chunk': {'answer': text_chunk}})}\n\n"
+                    
+                    # Si el chunk tiene 'docs', son los documentos fuente
+                    if 'docs' in chunk:
+                        docs = chunk['docs']
+                        collected_docs = docs
+                        
+                        # Extraer las fuentes de los documentos
+                        sources = []
+                        for doc in docs:
+                            if hasattr(doc, 'metadata') and 'source' in doc.metadata:
+                                # Extraer solo el nombre del archivo, no la ruta completa
+                                full_path = doc.metadata['source']
+                                filename = os.path.basename(full_path)
+                                sources.append(filename)
+                        
+                        # Enviar las fuentes al frontend
+                        if sources:
+                            yield f"data: {json.dumps({'chunk': {'docs': sources}})}\n\n"
+                
+                # Pequeña pausa para evitar saturar la conexión
+                await asyncio.sleep(0.01)
+            
+            # Enviar mensaje de finalización
+            yield f"data: [DONE]\n\n"
+            
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            error_msg = f"Error in streaming: {str(e)}"
+            print(error_msg)  # Log para debugging
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
     
-    from fastapi.responses import StreamingResponse
     return StreamingResponse(
         generate_response(),
-        media_type="text/plain",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Importante para nginx/proxy
+        }
     )
 
 
