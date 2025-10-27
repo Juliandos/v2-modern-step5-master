@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from langchain_community.document_loaders import DirectoryLoader, UnstructuredPDFLoader
+from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_openai import OpenAIEmbeddings
@@ -9,12 +9,12 @@ from langchain_openai import OpenAIEmbeddings
 load_dotenv()
 
 loader = DirectoryLoader(
-    os.path.abspath("../pdf-documents"),
+    os.path.abspath("./pdf-documents"),
     glob="**/*.pdf",
     use_multithreading=True,
     show_progress=True,
     max_concurrency=50,
-    loader_cls=UnstructuredPDFLoader,
+    loader_cls=PyPDFLoader,
 )
 docs = loader.load()
 
@@ -35,7 +35,7 @@ print(f"Created {len(chunks)} chunks from {len(docs)} documents")
 PGVector.from_documents(
     documents=chunks,
     embedding=embeddings,
-    collection_name="modern_rag_collection",
+    collection_name="collection164",
     connection_string=os.getenv("DATABASE_URL"),
     pre_delete_collection=True,
 )
