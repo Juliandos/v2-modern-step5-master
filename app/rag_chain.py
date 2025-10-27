@@ -22,7 +22,7 @@ embeddings = OpenAIEmbeddings(model='text-embedding-3-small')
 # Connect to the vector store  
 vector_store = PGVector(
     collection_name="collection164",
-    connection_string="postgresql+psycopg://postgres@localhost:5432/database164",
+    connection_string=os.getenv("DATABASE_URL"),
     embedding_function=embeddings
 )
 

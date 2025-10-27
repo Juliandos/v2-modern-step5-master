@@ -36,7 +36,7 @@ PGVector.from_documents(
     documents=chunks,
     embedding=embeddings,
     collection_name="modern_rag_collection",
-    connection_string="postgresql+psycopg://postgres@localhost:5432/modern_rag_db",
+    connection_string=os.getenv("DATABASE_URL"),
     pre_delete_collection=True,
 )
 
