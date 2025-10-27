@@ -10,7 +10,8 @@ import os
 import shutil
 import subprocess
 
-from app.rag_chain import final_chain
+# Importar las funciones correctas desde rag_chain
+from app.rag_chain import get_chain_response, get_chain_stream
 
 app = FastAPI(
     title="Modern RAG API",
@@ -59,12 +60,11 @@ async def query_documents(request: QueryRequest):
     Query the RAG system with a question about the uploaded documents.
     """
     try:
-        # Use the enhanced RAG chain with session support
-        invoke_input = {"question": request.question}
-        if request.config:
-            result = await final_chain.ainvoke(invoke_input, config=request.config)
-        else:
-            result = await final_chain.ainvoke(invoke_input)
+        result = await get_chain_response(
+            question=request.question,
+            config=request.config if hasattr(request, 'config') and request.config else None
+        )
+        
         return QueryResponse(
             answer=str(result.get("answer", "")),
             docs=[doc.page_content for doc in result.get("docs", [])]
@@ -80,15 +80,11 @@ async def stream_query(request: QueryRequest):
     """
     async def generate_response():
         try:
-            invoke_input = {"question": request.question}
-            config = request.config if hasattr(request, 'config') and request.config else None
-            
-            if config:
-                async for chunk in final_chain.astream(invoke_input, config=config):
-                    yield f"data: {json.dumps({'chunk': str(chunk)})}\n\n"
-            else:
-                async for chunk in final_chain.astream(invoke_input):
-                    yield f"data: {json.dumps({'chunk': str(chunk)})}\n\n"
+            async for chunk in get_chain_stream(
+                question=request.question,
+                config=request.config if hasattr(request, 'config') and request.config else None
+            ):
+                yield f"data: {json.dumps({'chunk': str(chunk)})}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
     

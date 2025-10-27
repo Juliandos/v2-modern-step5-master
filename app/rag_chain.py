@@ -1,18 +1,17 @@
 import os
 from operator import itemgetter
-from typing import TypedDict
+from typing import TypedDict, List, Dict, Any
 
 from dotenv import load_dotenv
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import RunnableParallel, RunnablePassthrough
+from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.retrievers.multi_query import MultiQueryRetriever
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import SQLChatMessageHistory
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import get_buffer_string
+from langchain_core.messages import get_buffer_string, HumanMessage, AIMessage
 
 load_dotenv()
 
@@ -49,32 +48,37 @@ multiquery = MultiQueryRetriever.from_llm(
     llm=llm,
 )
 
-# Create the old_chain with MultiQuery integration
-old_chain = (
-    RunnableParallel(
-        context=(itemgetter("question") | multiquery),
-        question=itemgetter("question")
-    ) |
-    RunnableParallel(
-        answer=(ANSWER_PROMPT | llm),
-        docs=itemgetter("context")
-    )
-).with_types(input_type=RagInput)
+# ========== IMPLEMENTACIÓN MANUAL DEL HISTORIAL ==========
 
 # Chat history configuration
-postgres_memory_url = "postgresql+psycopg://postgres:postgres@localhost:5432/pdf_rag_history"
+postgres_memory_url = os.getenv("DATABASE_URL_UNO")
 
-get_session_history = lambda session_id: SQLChatMessageHistory(
-    connection_string=postgres_memory_url,
-    session_id=session_id
-)
+def get_chat_history(session_id: str) -> List[Dict[str, str]]:
+    """Obtener historial de chat manualmente"""
+    try:
+        history = SQLChatMessageHistory(
+            connection_string=postgres_memory_url,
+            session_id=session_id
+        )
+        return history.messages
+    except Exception:
+        return []
+
+def save_to_chat_history(session_id: str, human_message: str, ai_message: str):
+    """Guardar mensajes en el historial manualmente"""
+    try:
+        history = SQLChatMessageHistory(
+            connection_string=postgres_memory_url,
+            session_id=session_id
+        )
+        history.add_user_message(human_message)
+        history.add_ai_message(ai_message)
+    except Exception as e:
+        print(f"Error saving chat history: {e}")
 
 # Template for standalone question generation from chat history
 template_with_history = """
-Given the following conversation and a follow
-up question, rephrase the follow up question
-to be a standalone question, in its original
-language
+Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question, in its original language.
 
 Chat History:
 {chat_history}
@@ -83,22 +87,105 @@ Standalone question:"""
 
 standalone_question_prompt = PromptTemplate.from_template(template_with_history)
 
-# Mini-chain to generate standalone questions from chat context
-standalone_question_mini_chain = RunnableParallel(
-    question=RunnableParallel(
-        question=RunnablePassthrough(),
-        chat_history=lambda x: get_buffer_string(x["chat_history"])
+def generate_standalone_question(question: str, chat_history: List) -> str:
+    """Generar pregunta standalone basada en el historial"""
+    if not chat_history:
+        return question
+    
+    history_text = get_buffer_string(chat_history)
+    
+    # Usar invoke en lugar de ainvoke para evitar problemas async
+    standalone_chain = (
+        standalone_question_prompt 
+        | llm 
+        | StrOutputParser()
     )
-    | standalone_question_prompt
-    | llm
-    | StrOutputParser()
-)
+    
+    return standalone_chain.invoke({
+        "chat_history": history_text,
+        "question": question
+    })
 
-# Final chain with message history support
-final_chain = RunnableWithMessageHistory(
-    runnable=standalone_question_mini_chain | old_chain,
-    input_messages_key="question",
-    history_messages_key="chat_history",
-    output_messages_key="answer",
-    get_session_history=get_session_history,
-)
+# Chain base SIN historial (para cuando no hay session_id)
+simple_chain = (
+    RunnableParallel(
+        context=(itemgetter("question") | multiquery),
+        question=itemgetter("question")
+    ) |
+    RunnableParallel(
+        answer=(ANSWER_PROMPT | llm | StrOutputParser()),
+        docs=itemgetter("context")
+    )
+).with_types(input_type=RagInput)
+
+# Chain CON historial (implementación manual)
+async def chain_with_history(question: str, session_id: str):
+    """Chain con historial implementado manualmente"""
+    try:
+        # Obtener historial
+        chat_history = get_chat_history(session_id)
+        
+        # Generar pregunta standalone si hay historial
+        if chat_history:
+            final_question = generate_standalone_question(question, chat_history)
+        else:
+            final_question = question
+        
+        # Ejecutar la chain simple con la pregunta procesada
+        result = await simple_chain.ainvoke({"question": final_question})
+        
+        # Guardar en historial
+        save_to_chat_history(session_id, question, result["answer"])
+        
+        return result
+        
+    except Exception as e:
+        # Fallback a chain simple sin historial
+        print(f"Error in chain_with_history: {e}")
+        return await simple_chain.ainvoke({"question": question})
+
+# Stream con historial
+async def stream_with_history(question: str, session_id: str):
+    """Stream con historial implementado manualmente"""
+    try:
+        # Obtener historial
+        chat_history = get_chat_history(session_id)
+        
+        # Generar pregunta standalone si hay historial
+        if chat_history:
+            final_question = generate_standalone_question(question, chat_history)
+        else:
+            final_question = question
+        
+        # Ejecutar stream con la pregunta procesada
+        async for chunk in simple_chain.astream({"question": final_question}):
+            yield chunk
+        
+        # Guardar en historial (necesitamos capturar la respuesta completa)
+        # Para streaming, esto es más complejo, así que lo omitimos por ahora
+        
+    except Exception as e:
+        # Fallback a stream simple sin historial
+        print(f"Error in stream_with_history: {e}")
+        async for chunk in simple_chain.astream({"question": question}):
+            yield chunk
+
+# Función principal para elegir la cadena correcta
+async def get_chain_response(question: str, config: dict = None):
+    """Elige entre chain con historial o sin historial"""
+    if config and config.get('configurable', {}).get('session_id'):
+        session_id = config['configurable']['session_id']
+        return await chain_with_history(question, session_id)
+    else:
+        return await simple_chain.ainvoke({"question": question})
+
+# Función para streaming
+async def get_chain_stream(question: str, config: dict = None):
+    """Elige entre stream con historial o sin historial"""
+    if config and config.get('configurable', {}).get('session_id'):
+        session_id = config['configurable']['session_id']
+        async for chunk in stream_with_history(question, session_id):
+            yield chunk
+    else:
+        async for chunk in simple_chain.astream({"question": question}):
+            yield chunk
